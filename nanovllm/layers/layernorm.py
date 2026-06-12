@@ -11,12 +11,12 @@ class RMSNorm(nn.Module):
     ) -> None:
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.weight = nn.Parameter(torch.ones(hidden_size))#就是RMSNorm中的y,可学习的参数
 
     @torch.compile
     def rms_forward(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor, #[词数，隐藏层维度]
     ) -> torch.Tensor:
         orig_dtype = x.dtype
         x = x.float()
@@ -29,11 +29,11 @@ class RMSNorm(nn.Module):
     def add_rms_forward(
         self,
         x: torch.Tensor,
-        residual: torch.Tensor,
+        residual: torch.Tensor, #形状与x一样
     ) -> tuple[torch.Tensor, torch.Tensor]:
         orig_dtype = x.dtype
         x = x.float().add_(residual.float())
-        residual = x.to(orig_dtype)
+        residual = x.to(orig_dtype) #变化前的值，主干道
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))
         x = x.to(orig_dtype).mul_(self.weight)

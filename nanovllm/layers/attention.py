@@ -18,15 +18,15 @@ def store_kvcache_kernel(
     slot_mapping_ptr,
     D: tl.constexpr,
 ):
-    idx = tl.program_id(0)
+    idx = tl.program_id(0)#triton竟然是simd
     slot = tl.load(slot_mapping_ptr + idx)
     if slot == -1: return
-    key_offsets = idx * key_stride + tl.arange(0, D)
+    key_offsets = idx * key_stride + tl.arange(0, D)#可以看出key目前是连续的
     value_offsets = idx * value_stride + tl.arange(0, D)
     key = tl.load(key_ptr + key_offsets)
     value = tl.load(value_ptr + value_offsets)
     cache_offsets = slot * D + tl.arange(0, D)
-    tl.store(k_cache_ptr + cache_offsets, key)
+    tl.store(k_cache_ptr + cache_offsets, key)#放就根据映射表不连续了
     tl.store(v_cache_ptr + cache_offsets, value)
 
 
@@ -73,3 +73,15 @@ class Attention(nn.Module):
                                         cache_seqlens=context.context_lens, block_table=context.block_tables, 
                                         softmax_scale=self.scale, causal=True)
         return o
+
+
+    # q=torch.randn(6, 2, 4),  # 总共有 6 个 Token，每个 Token 的 Query 是 [num_heads, head_dim]
+    # k=torch.randn(6, 2, 4),  # Key 的形状与 Query 相同
+    # v=torch.randn(6, 2, 4),  # Value 的形状与 Query 相同
+    # max_seqlen_q=3,          # Query 的最大序列长度（Batch 中最长的句子长度）
+    # cu_seqlens_q=torch.tensor([0, 2, 5, 6]),  # Query 的累积序列长度
+    # max_seqlen_k=3,          # Key 的最大序列长度（通常等于 max_seqlen_q）
+    # cu_seqlens_k=torch.tensor([0, 2, 5, 6]),  # Key 的累积序列长度
+    # softmax_scale=1 / 2,     # Softmax 缩放因子（1 / sqrt(head_dim)）
+    # causal=True,             # 启用因果掩码，防止看到未来的 Token
+    # block_table=None         # 分页内存表（这里假设没有分页）

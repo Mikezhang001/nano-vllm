@@ -17,27 +17,27 @@ class LLMEngine:
     def __init__(self, model, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        config = Config(model, **config_kwargs)
-        self.ps = []
-        self.events = []
-        ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size):
+        config = Config(model, **config_kwargs)## 1. 整理参数：从用户传进来的参数中，只挑选 Config（配置类）认识的参数
+        self.ps = [] #装进程
+        self.events = []#装进程的事件
+        ctx = mp.get_context("spawn") # 使用 spawn 模式启动全新的干净进程
+        for i in range(1, config.tensor_parallel_size):# 从1开始，都是子进程
             event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
+            process = ctx.Process(target=ModelRunner, args=(config, i, event))#Python 受限于全局解释器锁（GIL）
             process.start()
             self.ps.append(process)
             self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
+        self.model_runner = ModelRunner(config, 0, self.events) #主进程
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
-        atexit.register(self.exit)
+        atexit.register(self.exit) #它只会在整个 Python 脚本（程序）马上要结束并退出终端时触发，和析构函数不一样
 
     def exit(self):
         self.model_runner.call("exit")
         del self.model_runner
-        for p in self.ps:
-            p.join()
+        for p in self.ps: 
+            p.join()# 主程序在这里停下来死等
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):

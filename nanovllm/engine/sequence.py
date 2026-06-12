@@ -20,8 +20,8 @@ class Sequence:
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
-        self.num_tokens = len(self.token_ids)
-        self.num_prompt_tokens = len(token_ids)
+        self.num_tokens = len(self.token_ids)#会变化的
+        self.num_prompt_tokens = len(token_ids)#初始的
         self.num_cached_tokens = 0
         self.block_table = []
         self.temperature = sampling_params.temperature
@@ -34,7 +34,7 @@ class Sequence:
     def __getitem__(self, key):
         return self.token_ids[key]
 
-    @property
+    @property#用属性的方式访问方法
     def is_finished(self):
         return self.status == SequenceStatus.FINISHED
 
@@ -71,11 +71,11 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
 
-    def __getstate__(self):
+    def __getstate__(self):#序列化，对象保存到文件
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token)
 
-    def __setstate__(self, state):
+    def __setstate__(self, state):#反序列化，从文件生成对象
         self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
