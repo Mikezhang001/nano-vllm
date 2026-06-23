@@ -83,7 +83,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     ):
         self.output_sizes = output_sizes
         super().__init__(input_size, sum(output_sizes), bias)
-
+    #把多个线性层（如 gate+up）合并成一个权重矩阵，加载时按 shard_id 分别放到对应位置
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
         param_data = param.data
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
@@ -106,11 +106,14 @@ class QKVParallelLinear(ColumnParallelLinear):
         tp_size = dist.get_world_size()
         total_num_kv_heads = total_num_kv_heads or total_num_heads#GQA或MHA
         self.head_size = head_size
-        self.num_heads = divide(total_num_heads, tp_size)#对头切
-        self.num_kv_heads = divide(total_num_kv_heads, tp_size)
+        self.num_heads = divide(total_num_heads, tp_size)#切Q头
+        self.num_kv_heads = divide(total_num_kv_heads, tp_size)#切K头和V头
         output_size = (total_num_heads + 2 * total_num_kv_heads) * self.head_size
         super().__init__(hidden_size, output_size, bias)
-
+        
+        # weight.shape[0] = output_size	//(num_Q_heads + 2 × num_KV_heads) × head_size	Q+K+V 所有头的输出总维度
+        # weight.shape[1] = input_size	//hidden_size	每个 token 的输入特征维度
+        
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
         param_data = param.data
         assert loaded_shard_id in ["q", "k", "v"]

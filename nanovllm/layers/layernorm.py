@@ -24,7 +24,8 @@ class RMSNorm(nn.Module):
         x.mul_(torch.rsqrt(var + self.eps))
         x = x.to(orig_dtype).mul_(self.weight)
         return x
-
+# FX Tracer 会追踪进每个函数调用，把里面的操作全部展开，
+# 最终得到一个扁平的计算图——跟写法2 是一样的。然后 Inductor 再做融合
     @torch.compile
     def add_rms_forward(
         self,

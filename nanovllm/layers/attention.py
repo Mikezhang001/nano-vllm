@@ -59,15 +59,16 @@ class Attention(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
-        if k_cache.numel() and v_cache.numel():
+        if k_cache.numel() and v_cache.numel(): #排除warmup 阶段
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
-            if context.block_tables is not None:    # prefix cache
+            if context.block_tables is not None:    # 排除 warmup 和 prefix cache(无prefix cache)
                 k, v = k_cache, v_cache
-            o = flash_attn_varlen_func(q, k, v,
+            o = flash_attn_varlen_func(q, k, v,#block_tables空不空，决定如何读取k和v
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+                                       #context.block_tables需要统一补全为最长seq的block数，见prepare_block_tables方法
         else:    # decode
             o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                         cache_seqlens=context.context_lens, block_table=context.block_tables, 

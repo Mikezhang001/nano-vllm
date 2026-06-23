@@ -113,7 +113,7 @@ class ModelRunner:
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim) #虽然 torch.empty 在物理显存上开辟的是一整块绝对连续的“大操场”，但系统在逻辑上把它划分成了无数个“小隔间”，这就是所谓的大块兼具小块的效果
         layer_id = 0
         for module in self.model.modules():#大模型的内部是一层一层的 Transformer 堆叠起来的。每一层在算 Attention 的时候，都需要地方存自己的 KV 数据
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache"): #关联class Attention的k_cache和v_cache
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
@@ -153,7 +153,7 @@ class ModelRunner:
                     end = start + seq.last_block_num_tokens 
                 slot_mapping.extend(list(range(start, end)))                                                      #一个范围
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache 
-            block_tables = self.prepare_block_tables(seqs) #block_tables的初始化
+            block_tables = self.prepare_block_tables(seqs) #context.block_tables的初始化，
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -194,7 +194,7 @@ class ModelRunner:
         else:
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)] #找 graph_bs 中第一个大于等于实际 bs 的值
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
@@ -203,14 +203,14 @@ class ModelRunner:
             graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            graph.replay()
+            graph.replay() #重放录制的graph
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None #真正算出下一个token
         reset_context()
         return token_ids
 

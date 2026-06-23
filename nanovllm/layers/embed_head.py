@@ -21,7 +21,7 @@ class VocabParallelEmbedding(nn.Module):#分布式查词汇表
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size
         self.vocab_start_idx = self.num_embeddings_per_partition * self.tp_rank
         self.vocab_end_idx = self.vocab_start_idx + self.num_embeddings_per_partition
-        self.weight = nn.Parameter(torch.empty(self.num_embeddings_per_partition, embedding_dim))
+        self.weight = nn.Parameter(torch.empty(self.num_embeddings_per_partition, embedding_dim))#就是喜欢转置放
         self.weight.weight_loader = self.weight_loader
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -35,7 +35,7 @@ class VocabParallelEmbedding(nn.Module):#分布式查词汇表
         if self.tp_size > 1:
             mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
             x = mask * (x - self.vocab_start_idx)#这个得用mask，否则减出来负数
-        y = F.embedding(x, self.weight)
+        y = F.embedding(x, self.weight)#embedding只是查表，这里的tp可以看出linear转置的好处
         if self.tp_size > 1:
             y = mask.unsqueeze(1) * y
             dist.all_reduce(y)
@@ -53,10 +53,10 @@ class ParallelLMHead(VocabParallelEmbedding):
         assert not bias
         super().__init__(num_embeddings, embedding_dim)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor): #只在最后一层调用来预测
         context = get_context()
-        if context.is_prefill:
-            last_indices = context.cu_seqlens_q[1:] - 1 #每个句子开始位置 - 1变成结束位置，似乎是prefill每个batch的最后一个词
+        if context.is_prefill:#prefill阶段取每个最后一个，decode不用截取
+            last_indices = context.cu_seqlens_q[1:] - 1 #每个句子开始位置 - 1变成结束位置，似乎是prefill每个batch的最后一个词（第一个数0跳过）
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight) #和词汇表比相似度
         if self.tp_size > 1: #只有主节点0需要
