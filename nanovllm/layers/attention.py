@@ -62,14 +62,20 @@ class Attention(nn.Module):
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
-            if context.block_tables is not None:    # prefix cache
-                k, v = k_cache, v_cache
-            o = flash_attn_varlen_func(q, k, v,
-                                       max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                                       max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)
-        else:    # decode
+            # 含任何 prefill chunk 的批 (包括混合批) 统一走 varlen 路径
+            # 有 block_tables (正常推理) 时通过 paged KV 寻址; 无 (warmup) 时直接用本 step 的 k/v
+            if context.block_tables is not None:
+                k_in, v_in = k_cache, v_cache
+            else:
+                k_in, v_in = k, v
+            o = flash_attn_varlen_func(
+                q, k_in, v_in,
+                max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+                softmax_scale=self.scale, causal=True, block_table=context.block_tables,
+            )
+        else:    # 纯 decode 单 token, 走快路径以保留 CUDA Graph 能力
             o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
+                                        cache_seqlens=context.context_lens, block_table=context.block_tables,
                                         softmax_scale=self.scale, causal=True)
         return o

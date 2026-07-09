@@ -6,6 +6,16 @@ from nanovllm.engine.block_manager import BlockManager
 
 
 class Scheduler:
+    """混合批 (chunked prefill) 调度器。
+
+    每个 step 同时调度 decode 序列和 prefill chunk:
+      1) 先把 running 队列中能 append KV 的序列各预占 1 token (decode)
+      2) 用剩余 token 预算给 waiting 队列里的序列切 prefill chunk; 任意序列都可被 chunk
+      3) prefill 完成的最后一个 chunk 会触发采样, 产出第一个 decode token
+
+    is_decode_only=True 时本 batch 全为 decode 单 token, 可走 CUDA Graph 快速路径;
+    否则 (含任何 prefill chunk) 走 varlen 路径。
+    """
 
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs
@@ -23,54 +33,67 @@ class Scheduler:
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
-        scheduled_seqs = []
+        scheduled_seqs: list[Sequence] = []
+        decode_seqs: list[Sequence] = []
         num_batched_tokens = 0
 
-        # prefill
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.waiting[0]
-            remaining = self.max_num_batched_tokens - num_batched_tokens
-            if remaining == 0:
+        # ---------- 1) decode: 给 running 中的序列各占 1 token ----------
+        # 维持 FIFO; KV 不足时按 LIFO 抢占 running 队尾
+        while self.running and len(decode_seqs) < self.max_num_seqs:
+            if num_batched_tokens + 1 > self.max_num_batched_tokens:
                 break
-            if not seq.block_table:
-                num_cached_blocks = self.block_manager.can_allocate(seq)
-                if num_cached_blocks == -1:
-                    break
-                num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
-            else:
-                num_tokens = seq.num_tokens - seq.num_cached_tokens
-            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
-                break
-            if not seq.block_table:
-                self.block_manager.allocate(seq, num_cached_blocks)
-            seq.num_scheduled_tokens = min(num_tokens, remaining)
-            num_batched_tokens += seq.num_scheduled_tokens
-            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
-                seq.status = SequenceStatus.RUNNING
-                self.waiting.popleft()
-                self.running.append(seq)
-            scheduled_seqs.append(seq)
-
-        if scheduled_seqs:
-            return scheduled_seqs, True
-
-        # decode
-        while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
+            preempted = False
             while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
                     self.preempt(seq)
+                    preempted = True
                     break
+            if preempted:
+                break
+            seq.num_scheduled_tokens = 1
+            seq.is_prefill = False
+            self.block_manager.may_append(seq)
+            decode_seqs.append(seq)
+            num_batched_tokens += 1
+        # 暂不放回 running, 等 postprocess 之后由调用方维持
+        scheduled_seqs.extend(decode_seqs)
+
+        # ---------- 2) prefill: 用剩余 token 预算切 chunk ----------
+        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
+            remaining = self.max_num_batched_tokens - num_batched_tokens
+            if remaining <= 0:
+                break
+            seq = self.waiting[0]
+            if not seq.block_table:
+                num_cached_blocks = self.block_manager.can_allocate(seq)
+                if num_cached_blocks == -1:
+                    break  # KV 不足
+                num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
+                self.block_manager.allocate(seq, num_cached_blocks)
             else:
-                seq.num_scheduled_tokens = 1
-                seq.is_prefill = False
-                self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
-        assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+                # 被抢占恢复 或 chunked prefill 中途
+                num_tokens = seq.num_tokens - seq.num_cached_tokens
+            seq.num_scheduled_tokens = min(num_tokens, remaining)
+            num_batched_tokens += seq.num_scheduled_tokens
+            scheduled_seqs.append(seq)
+            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
+                # 本 step 完成 prefill, 出队列
+                self.waiting.popleft()
+            else:
+                # 还需要继续 chunk, 不出队列, 也不再调度后续 waiting (保证 FIFO 简单语义)
+                break
+
+        # 放回 running 头部, 保持 FIFO
+        if decode_seqs:
+            self.running.extendleft(reversed(decode_seqs))
+
+        assert scheduled_seqs, "no sequence scheduled; possibly all preempted"
+
+        is_decode_only = len(decode_seqs) == len(scheduled_seqs)
+        return scheduled_seqs, is_decode_only
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
@@ -78,15 +101,27 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
+    def postprocess(self, seqs: list[Sequence], token_ids: list[int | None]):
+        """处理本 step 各序列的产出。
+
+        token_ids[i] 为 None 表示该序列本 step 没有采样位置 (chunked prefill 中途)。
+        """
         for seq, token_id in zip(seqs, token_ids):
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
-            if is_prefill and seq.num_cached_tokens < seq.num_tokens:
+            if token_id is None:
+                # chunked prefill 中间段
                 continue
+            # 出了一个新 token
             seq.append_token(token_id)
+            # 若刚完成 prefill, 加入 running 队列
+            if seq.status == SequenceStatus.WAITING:
+                seq.status = SequenceStatus.RUNNING
+                seq.is_prefill = False
+                self.running.append(seq)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
-                self.running.remove(seq)
+                if seq in self.running:
+                    self.running.remove(seq)

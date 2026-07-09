@@ -47,10 +47,18 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        seqs, is_decode_only = self.scheduler.schedule()
+        # 统计: 正数 = prefill chunk token 总数; 负数 = decode 序列数
+        if is_decode_only:
+            num_tokens = -len(seqs)
+        else:
+            num_tokens = sum(seq.num_scheduled_tokens for seq in seqs
+                             if seq.num_cached_tokens + seq.num_scheduled_tokens != seq.num_tokens
+                             or seq.num_scheduled_tokens > 1)
+            if num_tokens == 0:    # 退化为全 decode (混合批里 prefill 那部分恰好都是 1 token, 极少见)
+                num_tokens = -len(seqs)
+        token_ids = self.model_runner.call("run", seqs, is_decode_only)
+        self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 

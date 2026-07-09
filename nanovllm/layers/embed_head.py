@@ -56,8 +56,13 @@ class ParallelLMHead(VocabParallelEmbedding):
     def forward(self, x: torch.Tensor):
         context = get_context()
         if context.is_prefill:
-            last_indices = context.cu_seqlens_q[1:] - 1
-            x = x[last_indices].contiguous()
+            # 混合批 / 含 prefill chunk: 用 logits_indices 抽取所有「需采样」的位置
+            if context.logits_indices is not None:
+                x = x[context.logits_indices].contiguous()
+            else:
+                # warmup 兜底: 沿用 cu_seqlens 取最后位置
+                last_indices = context.cu_seqlens_q[1:] - 1
+                x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
