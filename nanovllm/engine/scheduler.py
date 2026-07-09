@@ -25,12 +25,36 @@ class Scheduler:
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        # request_id -> Sequence, 用于 abort / 状态查询
+        self.request_map: dict[str, Sequence] = {}
 
     def is_finished(self):
         return not self.waiting and not self.running
 
+    def has_unfinished_requests(self) -> bool:
+        return not self.is_finished()
+
+    def get_num_unfinished_requests(self) -> int:
+        return len(self.waiting) + len(self.running)
+
     def add(self, seq: Sequence):
         self.waiting.append(seq)
+        self.request_map[seq.request_id] = seq
+
+    def abort(self, request_id: str) -> bool:
+        """外部主动取消一条请求。返回是否命中。"""
+        seq = self.request_map.get(request_id)
+        if seq is None or seq.is_finished:
+            return False
+        if seq in self.waiting:
+            self.waiting.remove(seq)
+        if seq in self.running:
+            self.running.remove(seq)
+        if seq.block_table:
+            self.block_manager.deallocate(seq)
+        seq.status = SequenceStatus.FINISHED
+        self.request_map.pop(seq.request_id, None)
+        return True
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs: list[Sequence] = []
@@ -125,3 +149,4 @@ class Scheduler:
                 self.block_manager.deallocate(seq)
                 if seq in self.running:
                     self.running.remove(seq)
+                self.request_map.pop(seq.request_id, None)
