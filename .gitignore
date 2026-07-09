@@ -196,3 +196,4 @@ cython_debug/
 
 # Model weights
 Qwen3-0.6B/
+Qwen3-8B/
