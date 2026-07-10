@@ -31,6 +31,16 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        # ---------- Speculative Decoding ----------
+        # target 已 commit 到 KV 的 token 数 (== num_tokens - 未 commit 的 draft 数)
+        # 非投机场景保持 == num_tokens
+        # 投机场景: draft 生成 k 个后 num_tokens 涨 k, num_committed 不变;
+        #           verify 后按接受数量前进
+        self.num_committed_tokens = len(token_ids)
+        # draft 独立 KV 的已写入长度 (每序列一份)
+        self.num_draft_committed_tokens = 0
+        # 本 step draft 已生成的 token id 列表 (在 spec verify 循环内使用)
+        self.draft_token_ids: list[int] = []
 
     def __len__(self):
         return self.num_tokens

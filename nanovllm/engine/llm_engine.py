@@ -8,7 +8,7 @@ import torch.multiprocessing as mp
 
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
-from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 
@@ -96,13 +96,94 @@ class LLMEngine:
                              or seq.num_scheduled_tokens > 1)
             if num_tokens == 0:
                 num_tokens = -len(seqs)
+        # ---------- Speculative Decoding 分支 ----------
+        # 仅在 全 decode + 启用 spec + 每条 seq 都恰好有 1 个待写入 token (last_token 尚未入 KV) 时启用
+        use_spec = (
+            is_decode_only
+            and getattr(self.model_runner, "spec_enabled", False)
+            and all(s.num_committed_tokens == s.num_tokens - 1 for s in seqs)
+        )
+        if use_spec:
+            # 预扩容 target block_table: draft 会追加 k 个 token, 需要 block 能覆盖到 num_tokens+k
+            k = self.model_runner.k_spec
+            bm = self.scheduler.block_manager
+            for seq in seqs:
+                needed_len = seq.num_tokens + k     # 保守估计: 最多再涨 k 个 draft
+                needed_blocks = (needed_len + seq.block_size - 1) // seq.block_size
+                while len(seq.block_table) < needed_blocks:
+                    if not bm.free_block_ids:
+                        # 显存不足, 放弃 spec, 走常规
+                        break
+                    seq.block_table.append(bm._allocate_block())
+                else:
+                    continue
+                # 若上面 break 了 (显存不足), 不走 spec
+                use_spec = False
+                break
+        if use_spec:
+            # run_spec 返回每 seq 本 step 新接受的 token id 列表 (长度 1..k+1)
+            accepted_lists = self.model_runner.call("run_spec", seqs)
+            outputs: list[RequestOutput] = []
+            # 因为 run_spec 内部已经把 accepted tokens 追加到 seq.token_ids 且更新 num_tokens
+            # 我们需要在这里 "回滚 num_tokens 到调度前", 走 scheduler.postprocess 的正常流程
+            # 但 scheduler.postprocess 假设每 seq 每 step 涨 1 token, 无法直接用
+            # 因此: 手工处理 postprocess + 生成 RequestOutput
+            for seq, accepted in zip(seqs, accepted_lists):
+                # 计算 delta 部分 (本 step 新增的 token 列表)
+                delta = list(accepted)
+                # completion tokens 已经在 seq.token_ids 里 (run_spec 已 append)
+                # 我们只做: block_manager.hash / may_append / EOS 判定
+                # 逐个 token 检查 EOS/max_tokens, 一旦命中就截断
+                # 注意: 需要维护 block_table 长度. 目前 append_token 仅在 scheduler.may_append 里扩展.
+                # spec 场景下我们跳过 hash_blocks (对 prefix caching 不友好但简单)
+                # BlockManager.may_append 按 seq.num_tokens 判断
+                # 需要对本 step 涨的每个 token 都 may_append 一次
+                # (先重置 seq 状态到 accept 前, 再逐个 append+may_append)
+                # 反向: 直接根据当前 num_tokens 补齐 block_table
+                self._extend_block_table_after_spec(seq)
+
+                # EOS / max_tokens 截断: 找到第一个触发的位置
+                cut_at = None
+                for j, tid in enumerate(delta):
+                    completion_len = (seq.num_tokens - len(delta) + j + 1) - seq.num_prompt_tokens
+                    if (not seq.ignore_eos and tid == self.scheduler.eos) or completion_len >= seq.max_tokens:
+                        cut_at = j + 1
+                        break
+                if cut_at is not None and cut_at < len(delta):
+                    # 截断 seq.token_ids 到 cut_at
+                    to_remove = len(delta) - cut_at
+                    seq.token_ids = seq.token_ids[:-to_remove]
+                    seq.num_tokens -= to_remove
+                    seq.last_token = seq.token_ids[-1]
+                    seq.num_committed_tokens = seq.num_tokens
+                    seq.num_draft_committed_tokens = seq.num_tokens
+                    delta = delta[:cut_at]
+
+                is_done = (
+                    (not seq.ignore_eos and delta and delta[-1] == self.scheduler.eos)
+                    or seq.num_completion_tokens >= seq.max_tokens
+                )
+                outputs.append(RequestOutput(
+                    request_id=seq.request_id,
+                    prompt_token_ids=seq.prompt_token_ids,
+                    token_ids=list(seq.completion_token_ids),
+                    delta_token_ids=delta,
+                    finished=is_done,
+                ))
+                if is_done:
+                    seq.status = SequenceStatus.FINISHED
+                    self.scheduler.block_manager.deallocate(seq)
+                    if seq in self.scheduler.running:
+                        self.scheduler.running.remove(seq)
+                    self.scheduler.request_map.pop(seq.request_id, None)
+            return outputs, num_tokens
+
+        # ---------- 常规路径 ----------
         token_ids = self.model_runner.call("run", seqs, is_decode_only)
-        # 生成增量输出前记录旧长度
         outputs: list[RequestOutput] = []
         if token_ids is not None:
             for seq, tid in zip(seqs, token_ids):
                 delta = [tid] if tid is not None else []
-                # 提前构造对象; finished 状态在 postprocess 后再修正
                 outputs.append(RequestOutput(
                     request_id=seq.request_id,
                     prompt_token_ids=seq.prompt_token_ids,
@@ -111,10 +192,25 @@ class LLMEngine:
                     finished=False,
                 ))
         self.scheduler.postprocess(seqs, token_ids)
-        # 补齐 finished 状态
+        # 常规路径: 每 step forward 会写入 上一步的 last_token 到 KV.
+        # 此步后 KV 中已有 seq[0..num_tokens-2] (旧 last_token 的 KV 刚在本 step forward 中写入),
+        # 新采样的 token (num_tokens-1) 的 KV 尚未写入.
+        # 所以 num_committed_tokens = num_tokens - 1
+        for seq in seqs:
+            seq.num_committed_tokens = max(0, seq.num_tokens - 1)
         for out, seq in zip(outputs, seqs):
             out.finished = seq.is_finished
         return outputs, num_tokens
+
+    def _extend_block_table_after_spec(self, seq):
+        """spec accept 后 seq.num_tokens 涨了 len(accepted), 补齐 block_table."""
+        bm = self.scheduler.block_manager
+        needed_blocks = seq.num_blocks
+        while len(seq.block_table) < needed_blocks:
+            # 直接从 free 拿 (spec 前 scheduler 已经预留了 1 block, 这里可能还差 0 or 1)
+            if not bm.free_block_ids:
+                raise RuntimeError("no free block for spec expansion, consider larger num_kvcache_blocks")
+            seq.block_table.append(bm._allocate_block())
 
     # ============ 向后兼容 ============
 
