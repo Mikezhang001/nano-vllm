@@ -156,7 +156,11 @@ class LLMEngine:
                     seq.num_tokens -= to_remove
                     seq.last_token = seq.token_ids[-1]
                     seq.num_committed_tokens = seq.num_tokens
-                    seq.num_draft_committed_tokens = seq.num_tokens
+                    # draft KV 里可能仍含被截断位置的 KV, 但 draft 有效前缀语义是
+                    # "已含 [0..值-1] 的 KV". 截断后新 num_tokens < 原值, 我们只需保证
+                    # num_draft_committed <= num_tokens (未来 catch-up 会正确处理更长范围).
+                    # 保守设成 min(现值, num_tokens), 确保不变量.
+                    seq.num_draft_committed_tokens = min(seq.num_draft_committed_tokens, seq.num_tokens)
                     delta = delta[:cut_at]
 
                 is_done = (

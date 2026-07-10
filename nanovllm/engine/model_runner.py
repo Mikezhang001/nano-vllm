@@ -440,18 +440,45 @@ class ModelRunner:
             seq.last_token = seq.token_ids[-1]
             seq.draft_token_ids = []
             seq.num_committed_tokens = max(0, seq.num_tokens - 1)
+
+            # draft KV commit 状态: draft 循环 k 次共写入 k 个位置
+            # [N_orig-1, N_orig, ..., N_orig+k-2] (每次 decode 写"当前 last_token 的 KV").
+            # 这 k 个位置的 token 是 [last_token, d_0, ..., d_{k-2}], 即前 k-1 个 draft token
+            # 已入 KV, 但**最后一个 draft token d_{k-1} 的 KV 没写**.
+            #
+            # 若全接受 (len(accepted)==k+1, seq 追加 [d_0, ..., d_{k-1}, bonus]):
+            #   draft KV 有效范围 [0..N_orig+k-2] (含 last_token 与前 k-1 个 draft),
+            #   缺 d_{k-1} (seq pos N_orig+k-1) 与 bonus (seq pos N_orig+k) 的 KV.
+            #   new_N = N_orig+k+1, D = N_orig+k-1 = new_N-2.
+            # 若部分接受 (accepted 长度 m+1, 拒第 m 个, target 修正 t 在 pos N_orig+m):
+            #   接受 d_0..d_{m-1} (共 m 个 draft), draft KV pos [N_orig..N_orig+m-1] 的 KV 正确,
+            #   加上 pos N_orig-1 的 last_token KV, 共有效范围 [0..N_orig+m-1].
+            #   拒 d_m..d_{k-1} 的 KV 在 pos [N_orig+m..N_orig+k-2] 需作废.
+            #   new_N = N_orig+m+1, D = N_orig+m = new_N-1.
+            new_N = seq.num_tokens
+            if len(accepted) == k + 1:
+                # 全接受: draft 缺 d_{k-1} 和 bonus 的 KV
+                seq.num_draft_committed_tokens = new_N - 2
+            else:
+                # 部分接受: draft 缺 target 修正 token 的 KV
+                seq.num_draft_committed_tokens = new_N - 1
         self.spec_stats["steps"] += 1
         return results
 
     def _draft_step_and_append(self, seqs: list[Sequence]):
         """让 draft 模型对每个 seq 生成 1 个 token, 追加到 seq.token_ids + draft KV.
 
-        MVP 策略: 每次调用时都对每条 seq 重新 lazy prefill draft KV.
-        - 优点: 完全避免 draft KV rollback 逻辑, 正确性最简单
-        - 缺点: draft 侧每 step 有 O(N) forward 开销. 0.6B 模型上仍显著快于 8B 一次 decode
-        - 每 seq 首次访问时 _draft_num_committed 会被重置, 全量重跑
+        Phase B 增量策略:
+        - 保持不变量: 进入本函数前 seq.num_draft_committed_tokens 表示 draft KV 已含
+          [0 .. num_draft_committed_tokens - 1] 的 KV.
+        - 首次访问 seq 或 draft 与 target 不同步时, 用一次 varlen catch-up 写入缺失段
+          [num_draft_committed .. N-2] (共 N-1-num_draft_committed 个位置).
+        - 然后走 flash_attn_with_kvcache decode 1 步, q=last_token (位置 N-1), 写入 slot N-1.
+        - 结束后 seq.num_draft_committed = N (含本步新写入的 last_token).
+        - append 新 draft token, num_tokens += 1, num_draft_committed 保持 = 新 num_tokens - 1.
         """
-        # 首次进入时为每条 seq 分配 draft block table (lazy)
+        # ---------- 1) 分配 draft block_table (lazy) + catch-up 缺失段 ----------
+        catchup_seqs: list[Sequence] = []
         for seq in seqs:
             if not hasattr(seq, "_draft_block_table") or not seq._draft_block_table:
                 num_blocks_per_seq = (self.config.max_model_len + self.block_size - 1) // self.block_size
@@ -463,38 +490,51 @@ class ModelRunner:
                         f"but only {self.draft_num_blocks} draft blocks"
                     )
                 seq._draft_block_table = list(range(start_block, start_block + num_blocks_per_seq))
-                seq._draft_num_committed = 0
-            # 检查 draft KV 是否与当前 seq.num_tokens 对齐 (每次都重新对齐, MVP)
-            # 若 draft 已 commit 长度 != seq.num_tokens - 1 (上一步 target 修正 token 后需要补写),
-            # 则重新 prefill 到 num_tokens - 1 位置 (最后 1 个 token 会被本次 draft step 作为 query 写入)
-            # 实际做法: 每步都全量 prefill (0..num_tokens-1), 最后 1 个 token 由这次 decode step 写.
-            # 更简单: 直接把 [0..num_tokens-1] 全写好, 然后 decode 1 步 (query=last_token, 写位置 num_tokens-1)
-            # 但 last_token 的 KV 也需要写入.
-            # 决策: 每步全量重写 [0..num_tokens-1] (含 last), 然后 decode 步 forward 1 个新位置
-            self._draft_full_prefill_seq(seq)
+                seq.num_draft_committed_tokens = 0
 
-        # 现在 draft KV 里 [0..num_tokens-1] 都已就绪. decode 1 步生成 next token.
-        input_ids = []
-        positions = []
-        slot_mapping = []
-        context_lens = []
+            N = seq.num_tokens
+            D = seq.num_draft_committed_tokens
+            # 我们希望 decode 前 draft KV 里已有 [0..N-2] 的 KV
+            # (last_token N-1 由本步 decode 写入). 若 D < N-1, 需要 catch-up 段 [D..N-2].
+            # 若 D >= N-1, 无需 catch-up. 特殊情况 D == N: 说明 last_token KV 已存在
+            # (通常不会发生, 因为 verify 后我们把 D 设成 N-1 或 N-2), 保护性处理.
+            if D < N - 1:
+                catchup_seqs.append(seq)
+            elif D > N:
+                # 不变量违反: draft 走到 target 前面. 目前流程不应发生.
+                raise RuntimeError(
+                    f"draft KV ahead of target: seq={seq.seq_id} D={D} N={N}"
+                )
+
+        if catchup_seqs:
+            self._draft_catchup_prefill(catchup_seqs)
+        # 现在所有 seq 的 draft KV [0..N-2] 都齐了 (D >= N-1)
+
+        # ---------- 2) draft decode 1 步 ----------
+        # q = last_token (pos N-1); 若 last_token 的 KV 已在 draft (D == N), slot=-1 跳过写.
+        input_ids: list[int] = []
+        positions: list[int] = []
+        slot_mapping: list[int] = []
+        context_lens: list[int] = []
         max_block_len = max(len(seq._draft_block_table) for seq in seqs)
-        block_tables = []
+        block_tables: list[list[int]] = []
         for seq in seqs:
-            # 新位置 = num_tokens (即将写入的 slot); query 用当前 last_token
-            # 但 last_token 的 KV 已经在 _draft_full_prefill_seq 写好了 (位置 num_tokens-1)
-            # decode 1 步意味着: query=seq[num_tokens-1] 位置的 hidden -> next token logit
-            # 但 last_token 已在 KV, 我们不需要再写入 -- 用 flash_attn_with_kvcache 走纯 decode 路径
-            # 但那需要 num_tokens 已经是新 token 之后的; 这里我们要的是 P(next | seq[0..num_tokens-1])
-            # flash_attn_with_kvcache 会用 cache_seqlens 判断有效 KV 长度
-            # 所以: cache_seqlens = num_tokens (含 last_token), input 是 last_token 作 query
-            # slot_mapping = -1 (last_token KV 已存在)
-            tok = seq.last_token
-            pos = len(seq) - 1   # last_token 位置
-            input_ids.append(tok)
-            positions.append(pos)
-            context_lens.append(len(seq))
-            slot_mapping.append(-1)   # 不重复写
+            N = seq.num_tokens
+            D = seq.num_draft_committed_tokens
+            input_ids.append(seq.last_token)
+            positions.append(N - 1)
+            context_lens.append(N)
+            if D == N:
+                # last_token KV 已存在, 不重复写
+                slot_mapping.append(-1)
+            else:
+                # D == N - 1, 本步写入 pos N-1
+                pos = N - 1
+                block_idx = pos // self.block_size
+                slot_in_block = pos % self.block_size
+                slot_mapping.append(
+                    seq._draft_block_table[block_idx] * self.block_size + slot_in_block
+                )
             bt = seq._draft_block_table + [-1] * (max_block_len - len(seq._draft_block_table))
             block_tables.append(bt)
 
@@ -511,40 +551,72 @@ class ModelRunner:
         next_tokens = self.sampler(logits, temperatures).tolist()
         reset_context()
 
-        # 追加到 seq
+        # ---------- 3) 追加 draft token + 更新 num_draft_committed ----------
+        # 本步 draft KV 已含 [0..N-1] (含 last_token); 新 token N 尚未写入 KV.
+        # 追加后 seq.num_tokens = N+1, 我们希望 num_draft_committed = (N+1) - 1 = N.
         for seq, tid in zip(seqs, next_tokens):
+            # 先更新 draft_committed 到含 last_token 的位置 N (即旧 num_tokens)
+            seq.num_draft_committed_tokens = seq.num_tokens
             seq.token_ids.append(tid)
             seq.num_tokens += 1
             seq.last_token = tid
             seq.draft_token_ids.append(tid)
 
-    def _draft_full_prefill_seq(self, seq: Sequence):
-        """把 seq.token_ids[0..num_tokens-1] 全量写入 draft KV.
+    def _draft_catchup_prefill(self, seqs: list[Sequence]):
+        """一次 varlen forward 把多条 seq 的缺失段 [num_draft_committed .. N-2] 写入 draft KV.
 
-        MVP 策略: 每次 spec step 前都调用一次, 完全避免 rollback 复杂度.
+        进入时保证每条 seq: num_draft_committed_tokens < num_tokens - 1.
+        退出时 seq.num_draft_committed_tokens = seq.num_tokens - 1.
         """
-        n = seq.num_tokens
-        assert n >= 1
-        slot_mapping = []
-        for pos in range(n):
-            block_idx = pos // self.block_size
-            slot_in_block = pos % self.block_size
-            slot_mapping.append(seq._draft_block_table[block_idx] * self.block_size + slot_in_block)
+        input_ids: list[int] = []
+        positions: list[int] = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        slot_mapping: list[int] = []
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+        max_block_len = max(len(seq._draft_block_table) for seq in seqs)
+        block_tables: list[list[int]] = []
 
-        input_ids_t = torch.tensor(seq.token_ids[:n], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions_t = torch.tensor(list(range(n)), dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_q_t = torch.tensor([0, n], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_k_t = torch.tensor([0, n], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        for seq in seqs:
+            N = seq.num_tokens
+            D = seq.num_draft_committed_tokens
+            q_start = D
+            q_end = N - 1     # exclusive, 不含 last_token (由后续 decode 写)
+            q_len = q_end - q_start
+            assert q_len > 0
+            k_len = q_end     # 因果 attention, key 长度 = 到 q_end 为止的全部前缀
+            input_ids.extend(seq.token_ids[q_start:q_end])
+            positions.extend(range(q_start, q_end))
+            cu_seqlens_q.append(cu_seqlens_q[-1] + q_len)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + k_len)
+            max_seqlen_q = max(max_seqlen_q, q_len)
+            max_seqlen_k = max(max_seqlen_k, k_len)
+            for pos in range(q_start, q_end):
+                block_idx = pos // self.block_size
+                slot_in_block = pos % self.block_size
+                slot_mapping.append(
+                    seq._draft_block_table[block_idx] * self.block_size + slot_in_block
+                )
+            bt = seq._draft_block_table + [-1] * (max_block_len - len(seq._draft_block_table))
+            block_tables.append(bt)
+
+        input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions_t = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q_t = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k_t = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping_t = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables_t = torch.tensor([seq._draft_block_table], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables_t = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
         set_context(True,
                     cu_seqlens_q=cu_seqlens_q_t, cu_seqlens_k=cu_seqlens_k_t,
-                    max_seqlen_q=n, max_seqlen_k=n,
+                    max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
                     slot_mapping=slot_mapping_t, block_tables=block_tables_t)
         _ = self.draft_model(input_ids_t, positions_t)
         reset_context()
-        seq._draft_num_committed = n
+
+        for seq in seqs:
+            seq.num_draft_committed_tokens = seq.num_tokens - 1
 
     def _target_verify(self, seqs: list[Sequence], k: int) -> torch.Tensor:
         """target 一次 forward 验证 k 个 draft token.
