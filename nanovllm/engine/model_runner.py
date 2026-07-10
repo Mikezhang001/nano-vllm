@@ -26,9 +26,19 @@ class ModelRunner:
         # ---------- Speculative Decoding 相关 ----------
         self.spec_enabled = config.speculative_model is not None
         self.k_spec = config.num_speculative_tokens if self.spec_enabled else 0
+        # ---------- MTP (Multi-Token Prediction) 相关 ----------
+        # spec 与 mtp 二选一 (mtp 优先, 因为它是 "上位" 抽象)
+        self.mtp_enabled = config.mtp_module is not None
+        if self.mtp_enabled and self.spec_enabled:
+            # 用户同时设置了两者, 关闭 spec (MTP 走同一套 draft 底层)
+            self.spec_enabled = False
+        self.k_mtp = config.mtp_num_heads if self.mtp_enabled else 0
         self.draft_model = None
         self.draft_kv_cache = None
         self.draft_num_blocks = 0
+        # 供 MTPPredictor / MTPVerifier 使用 (spec / mtp 复用 draft_model 存储)
+        self.mtp_predictor = None
+        self.mtp_verifier = None
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -45,6 +55,9 @@ class ModelRunner:
         # 加载 draft 模型 (在 target KV 分配后, 剩余显存里再切一块给 draft KV)
         if self.spec_enabled:
             self._init_draft_model()
+        # 加载 MTP module (模拟版: 与 draft 相同的加载路径, 只是配置字段不同)
+        if self.mtp_enabled:
+            self._init_mtp_module()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -74,6 +87,28 @@ class ModelRunner:
         load_model(self.draft_model, self.config.speculative_model)
         # draft 独立 KV cache 分配 (方案 A: 完全独立)
         self._allocate_draft_kv_cache()
+
+    def _init_mtp_module(self):
+        """加载 MTP module (模拟实现: 与 draft 模型加载路径一致).
+
+        真实 MTP: target 模型自带 D 个 MTP module, 无需单独加载.
+        模拟版: 用外部小模型顶替, 复用 draft_model / draft_kv_cache 存储.
+        """
+        assert self.world_size == 1, "MTP with tp>1 not implemented yet"
+        from nanovllm.engine.mtp import MTPPredictor, MTPVerifier
+        mtp_cfg = self.config.mtp_hf_config
+        self.draft_model = Qwen3ForCausalLM(mtp_cfg)   # 复用 draft_model 字段存储
+        load_model(self.draft_model, self.config.mtp_module)
+        # 复用 draft KV cache 逻辑 (num_speculative_kvcache_blocks / draft_hf_config 皆可)
+        # 若 mtp 独立字段有值优先, 否则退回 speculative_* 计算
+        if self.config.num_mtp_kvcache_blocks > 0:
+            self.config.num_speculative_kvcache_blocks = self.config.num_mtp_kvcache_blocks
+        # 让 draft_hf_config 指向 mtp_hf_config 以复用 _allocate_draft_kv_cache
+        self.config.draft_hf_config = mtp_cfg
+        self._allocate_draft_kv_cache()
+        # 建立 MTP predictor / verifier
+        self.mtp_predictor = MTPPredictor(self, self.k_mtp)
+        self.mtp_verifier = MTPVerifier(self, self.k_mtp)
 
     def _allocate_draft_kv_cache(self):
         cfg = self.config
@@ -175,11 +210,11 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        # 若启用投机, 预留一部分显存给 draft 模型权重和 KV
+        # 若启用投机 / MTP, 预留一部分显存给 draft/mtp 模型权重和 KV
         util = config.gpu_memory_utilization
-        if config.speculative_model is not None:
-            # 粗略估计: draft 权重 ~ 0.6B * 2 bytes = 1.2GB; draft KV 会再吃掉一些 (由 _allocate_draft_kv_cache 走剩余显存);
-            # 这里给 target 少留一点空间, 让 draft 权重能进来
+        if config.speculative_model is not None or config.mtp_module is not None:
+            # 粗略估计: draft/mtp 权重 ~ 0.6B * 2 bytes = 1.2GB; 其 KV 会再吃掉一些 (由
+            # _allocate_draft_kv_cache 走剩余显存); 这里给 target 少留一点空间.
             util = min(util, 0.55)
         config.num_kvcache_blocks = int(total * util - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
@@ -382,6 +417,30 @@ class ModelRunner:
 
         # ---------- 4) 贪婪等价比对 + rollback ----------
         return self._verify_and_accept(seqs, target_tokens, k, original_num_tokens)
+
+    @torch.inference_mode()
+    def run_mtp(self, seqs: list[Sequence]) -> list[list[int]]:
+        """Multi-Token Prediction step. 语义上 == "target 自带 D 个 MTP head 一次多预测 D+1 个 token".
+
+        当前模拟实现: 使用 mtp_module 小模型串行产 D 个 candidate, 复用 spec 的
+        draft-generate + target-verify 流水线. 与 run_spec 的实现差异仅在**接口层**:
+          - MTPPredictor 表达 "chain of MTP modules"
+          - MTPVerifier 表达 "target 一次 forward verify + main head bonus"
+
+        真实 MTP 落地时替换 MTPPredictor 内部为 target 内置 head chain forward 即可,
+        本函数骨架不变.
+        """
+        assert self.mtp_enabled and self.rank == 0
+        assert self.mtp_predictor is not None and self.mtp_verifier is not None
+        D = self.k_mtp
+
+        original_num_tokens = [seq.num_tokens for seq in seqs]
+
+        # ---------- 1) MTP module chain: 产 D 个 candidate ----------
+        self.mtp_predictor.predict_chain(seqs)
+
+        # ---------- 2) target verify + accept (含 main head 的 bonus token) ----------
+        return self.mtp_verifier.verify_and_accept(seqs, original_num_tokens)
 
     def _verify_and_accept(
         self,

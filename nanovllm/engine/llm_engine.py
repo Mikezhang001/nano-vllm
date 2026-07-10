@@ -96,33 +96,41 @@ class LLMEngine:
                              or seq.num_scheduled_tokens > 1)
             if num_tokens == 0:
                 num_tokens = -len(seqs)
-        # ---------- Speculative Decoding 分支 ----------
-        # 仅在 全 decode + 启用 spec + 每条 seq 都恰好有 1 个待写入 token (last_token 尚未入 KV) 时启用
-        use_spec = (
+        # ---------- Speculative Decoding / MTP 分支 ----------
+        # 仅在 全 decode + 启用 spec/mtp + 每条 seq 都恰好有 1 个待写入 token (last_token 尚未入 KV) 时启用
+        # MTP 与 spec 走同一条路径, 仅命名/接口层不同 (未来实现独立)
+        mtp_enabled = getattr(self.model_runner, "mtp_enabled", False)
+        spec_enabled = getattr(self.model_runner, "spec_enabled", False)
+        use_accel = (
             is_decode_only
-            and getattr(self.model_runner, "spec_enabled", False)
+            and (spec_enabled or mtp_enabled)
             and all(s.num_committed_tokens == s.num_tokens - 1 for s in seqs)
         )
+        # 保留原变量名, 后续代码统一用 use_spec 判断 (spec 和 mtp 语义等价)
+        use_spec = use_accel
+        # k 值: mtp 走 k_mtp, spec 走 k_spec
+        k_accel = self.model_runner.k_mtp if mtp_enabled else self.model_runner.k_spec
         if use_spec:
-            # 预扩容 target block_table: draft 会追加 k 个 token, 需要 block 能覆盖到 num_tokens+k
-            k = self.model_runner.k_spec
+            # 预扩容 target block_table: draft/mtp 会追加 k 个 token, 需要 block 能覆盖到 num_tokens+k
+            k = k_accel
             bm = self.scheduler.block_manager
             for seq in seqs:
-                needed_len = seq.num_tokens + k     # 保守估计: 最多再涨 k 个 draft
+                needed_len = seq.num_tokens + k     # 保守估计: 最多再涨 k 个候选
                 needed_blocks = (needed_len + seq.block_size - 1) // seq.block_size
                 while len(seq.block_table) < needed_blocks:
                     if not bm.free_block_ids:
-                        # 显存不足, 放弃 spec, 走常规
+                        # 显存不足, 放弃 spec/mtp, 走常规
                         break
                     seq.block_table.append(bm._allocate_block())
                 else:
                     continue
-                # 若上面 break 了 (显存不足), 不走 spec
+                # 若上面 break 了 (显存不足), 不走 spec/mtp
                 use_spec = False
                 break
         if use_spec:
-            # run_spec 返回每 seq 本 step 新接受的 token id 列表 (长度 1..k+1)
-            accepted_lists = self.model_runner.call("run_spec", seqs)
+            # spec 走 run_spec, mtp 走 run_mtp
+            method = "run_mtp" if mtp_enabled else "run_spec"
+            accepted_lists = self.model_runner.call(method, seqs)
             outputs: list[RequestOutput] = []
             # 因为 run_spec 内部已经把 accepted tokens 追加到 seq.token_ids 且更新 num_tokens
             # 我们需要在这里 "回滚 num_tokens 到调度前", 走 scheduler.postprocess 的正常流程

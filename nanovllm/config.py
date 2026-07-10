@@ -25,6 +25,20 @@ class Config:
     num_speculative_kvcache_blocks: int = -1
     # 内部字段: draft 模型的 hf_config, __post_init__ 填充
     draft_hf_config: AutoConfig | None = None
+    # ---------- Multi-Token Prediction (MTP, DeepSeek-V3 style) ----------
+    # 说明: 真实 MTP 中 target 模型自带 D 个 MTP module, 每个 module 输入
+    # (target_hidden, next_token_embed), 链式产 D 个 next-token 候选.
+    # 本 MVP 中没有能在 4xL20 上跑的原生 MTP 开源模型 (DeepSeek-V3 需 >600GB),
+    # 因此用一个小模型 (通常与 draft 相同) 模拟 D 个 MTP module 的行为,
+    # 复用现有 spec 的 draft-generate + target-verify 流水线, 仅在语义/接口层暴露 MTP.
+    # 若同时设置 speculative_model 与 mtp_module, spec 优先关闭, 走 mtp 路径.
+    mtp_module: str | None = None
+    # MTP module 数量 D, target verify 时读 D+1 个位置
+    mtp_num_heads: int = 3
+    # MTP module 的 KV cache 块数, -1 动态分配
+    num_mtp_kvcache_blocks: int = -1
+    # 内部: MTP module 的 hf_config
+    mtp_hf_config: AutoConfig | None = None
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -39,5 +53,13 @@ class Config:
             # 投机解码前提: draft/target 词表一致
             assert self.draft_hf_config.vocab_size == self.hf_config.vocab_size, (
                 f"draft vocab_size ({self.draft_hf_config.vocab_size}) != "
+                f"target vocab_size ({self.hf_config.vocab_size})"
+            )
+        if self.mtp_module is not None:
+            assert os.path.isdir(self.mtp_module), f"mtp module dir not found: {self.mtp_module}"
+            assert self.mtp_num_heads >= 1
+            self.mtp_hf_config = AutoConfig.from_pretrained(self.mtp_module)
+            assert self.mtp_hf_config.vocab_size == self.hf_config.vocab_size, (
+                f"mtp vocab_size ({self.mtp_hf_config.vocab_size}) != "
                 f"target vocab_size ({self.hf_config.vocab_size})"
             )
