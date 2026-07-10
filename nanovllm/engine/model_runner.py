@@ -381,53 +381,65 @@ class ModelRunner:
                 print(f"[SPEC] seq{i} target={target_tokens[base:base+k+1]}")
 
         # ---------- 4) 贪婪等价比对 + rollback ----------
-        results: list[list[int]] = []
+        return self._verify_and_accept(seqs, target_tokens, k, original_num_tokens)
+
+    def _verify_and_accept(
+        self,
+        seqs: list[Sequence],
+        target_tokens: list[int],
+        k: int,
+        original_num_tokens: list[int],
+    ) -> list[list[int]]:
+        """通用 verify-and-accept 逻辑, 供 Speculative Decoding / MTP 复用.
+
+        Args:
+            seqs: 本 step 参与投机的 seq 列表. 要求 seq.draft_token_ids 已含本 step k 个 draft.
+            target_tokens: target 一次 forward 得到的每条 seq 的 k+1 个 next-token 采样,
+                          扁平化为长度 N*(k+1) 的 list, seq i 对应 [i*(k+1) : (i+1)*(k+1)].
+            k: 每 seq draft 的 token 数.
+            original_num_tokens: 每条 seq 进入本 spec step 前的 num_tokens (含 last_token,
+                                 不含本 step 追加的 k 个 draft), 用于 rollback.
+
+        Returns:
+            每 seq 本 step 新接受的 token 列表 (长度 1..k+1).
+
+        副作用:
+            - 更新 seq.token_ids / num_tokens / last_token / num_committed_tokens
+            - 清空 seq.draft_token_ids
+            - 更新 self.spec_stats
+        """
         if not hasattr(self, "spec_stats"):
             self.spec_stats = {"draft_total": 0, "draft_accepted": 0, "steps": 0}
+
+        results: list[list[int]] = []
         for i, seq in enumerate(seqs):
             base = i * (k + 1)
-            target_slice = target_tokens[base : base + k + 1]  # target 对每个位置的采样
-            draft_slice = seq.draft_token_ids                  # 本 step draft 的 k 个 token
-            # target 位置 0..k-1 的 next token 用来验证 draft[0..k-1]
-            # target 位置 k 的 next token 是 draft 全接受时的 bonus token
+            target_slice = target_tokens[base : base + k + 1]
+            draft_slice = seq.draft_token_ids
             accepted: list[int] = []
             for j in range(k):
-                # 贪婪比对: target 的第 j 个位置采出的 token 若等于 draft[j] 则接受
-                # 否则接受 target[j] 作为修正 token, 停止
                 if target_slice[j] == draft_slice[j]:
                     accepted.append(draft_slice[j])
                 else:
-                    accepted.append(target_slice[j])  # 修正 token, 替换 draft[j]
+                    accepted.append(target_slice[j])   # 修正 token
                     break
             else:
-                # k 个都通过, 加入 bonus token
-                accepted.append(target_slice[k])
+                accepted.append(target_slice[k])       # bonus token
 
             results.append(accepted)
-            # 统计: k 个 draft 中被接受的数量
-            #  - 若 len(accepted)==k+1: k 个 draft 全对 + 1 bonus, accepted_draft = k
-            #  - 若 len(accepted)==m (m<=k): 前 m-1 个 draft 对 + 1 个 target 修正, accepted_draft = m-1
             accepted_draft = k if len(accepted) == k + 1 else len(accepted) - 1
             self.spec_stats["draft_total"] += k
             self.spec_stats["draft_accepted"] += accepted_draft
 
-            # ---------- 5) rollback seq state ----------
-            # verify 前 seq.token_ids 长度 = original_num_tokens[i] + k
-            # (原始 N_orig 含 last_token, 后追加 k 个 draft)
-            # 接受 m 个后, 新长度 = N_orig + m
-            # 前 N_orig 个不变 (含 last_token), 后 m 个 = accepted
+            # rollback + apply
             N_orig = original_num_tokens[i]
-            seq.token_ids = seq.token_ids[:N_orig]  # 去掉 k 个 draft
+            seq.token_ids = seq.token_ids[:N_orig]
             for tid in accepted:
                 seq.token_ids.append(tid)
             seq.num_tokens = N_orig + len(accepted)
             seq.last_token = seq.token_ids[-1]
             seq.draft_token_ids = []
-            # KV 语义: verify 已把 seq[N_orig-1..N_orig+k-1] 全写入,
-            # 但当 accepted 末尾是 target 修正 token 时, 该 token 的 KV 与 draft 的不同,
-            # 需要下 step 重新 forward 写入. 统一做法: num_committed = new_num_tokens - 1
             seq.num_committed_tokens = max(0, seq.num_tokens - 1)
-            # draft KV 每 step 全量重写 (_draft_full_prefill_seq), 这里不用维护 _draft_num_committed
         self.spec_stats["steps"] += 1
         return results
 

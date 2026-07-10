@@ -8,4 +8,6 @@ class SamplingParams:
     ignore_eos: bool = False
 
     def __post_init__(self):
-        assert self.temperature > 1e-10, "greedy sampling is not permitted"
+        # temperature == 0 表示贪婪采样 (argmax, 确定性)
+        # temperature > 0 走 Gumbel-max 随机采样
+        assert self.temperature >= 0, "temperature must be non-negative"

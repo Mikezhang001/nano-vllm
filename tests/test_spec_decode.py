@@ -49,7 +49,7 @@ def run(target_path: str, draft_path: str | None, prompts: list[str], k: int, ma
         tok.apply_chat_template([{"role": "user", "content": p}], tokenize=False, add_generation_prompt=True)
         for p in prompts
     ]
-    sp = SamplingParams(temperature=0.001, max_tokens=max_tokens)  # 近似贪婪
+    sp = SamplingParams(temperature=0.0, max_tokens=max_tokens)   # 贪婪采样, 确定性
     t0 = time.perf_counter()
     outs = llm.generate(prompt_texts, sp, use_tqdm=False)
     dt = time.perf_counter() - t0
